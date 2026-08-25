@@ -1,7 +1,7 @@
 param(
-    [Parameter(Mandatory=$true)][string]$XamppPath,
-    [Parameter(Mandatory=$true)][string]$PhpZipPath,
-    [Parameter(Mandatory=$true)][string]$AppName,
+    [string]$XamppPath,
+    [string]$PhpZipPath,
+    [string]$AppName,
     [string]$SourcePath,
     [string]$DocRootSubfolder = "public",
     [switch]$BackupMySql
@@ -9,6 +9,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $script:LogFilePath = $null
+$script:ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 function Log($msg) {
     $line = "[$(Get-Date -Format 'HH:mm:ss')] $msg"
@@ -48,6 +49,68 @@ function Get-TempRootPath {
     }
 
     throw "Unable to create a temporary working directory on C: or in the system temp path."
+}
+
+function Get-DefaultXamppPath {
+    $candidates = @(
+        'C:\xampp',
+        'D:\xampp',
+        'C:\xampp8',
+        (Join-Path $env:ProgramFiles 'xampp')
+    )
+    foreach ($candidate in $candidates) {
+        if ((Test-Path (Join-Path $candidate 'php')) -and (Test-Path (Join-Path $candidate 'mysql'))) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+function Read-PromptWithDefault {
+    param(
+        [Parameter(Mandatory=$true)][string]$Prompt,
+        [string]$Default = ''
+    )
+    $suffix = if ($Default) { " [$Default]" } else { "" }
+    $val = Read-Host "$Prompt$suffix"
+    if ([string]::IsNullOrWhiteSpace($val)) { return $Default }
+    return $val.Trim()
+}
+
+function Install-VCRedistIfNeeded {
+    $installed = $false
+    try {
+        $val = Get-ItemPropertyValue -Path 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\X64' -Name 'Installed' -ErrorAction Stop
+        $installed = ($val -eq 1)
+    }
+    catch {
+        $installed = $false
+    }
+
+    if ($installed) {
+        Log "VC++ 2015-2022 x64 redistributable already installed"
+        return
+    }
+
+    Log "VC++ 2015-2022 x64 redistributable not found; PHP 8.5 needs it to run"
+    $localRedist = Join-Path $script:ScriptDir 'vc_redist.x64.exe'
+    $redistPath = $null
+
+    if (Test-Path $localRedist) {
+        $redistPath = $localRedist
+    }
+    else {
+        Log "vc_redist.x64.exe not found alongside script; downloading from Microsoft"
+        $redistPath = Join-Path (Get-TempRootPath) 'vc_redist.x64.exe'
+        Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile $redistPath -UseBasicParsing
+    }
+
+    Log "Installing VC++ redistributable (silent)"
+    $proc = Start-Process -FilePath $redistPath -ArgumentList '/install', '/quiet', '/norestart' -Wait -PassThru
+    if ($proc.ExitCode -notin @(0, 3010, 1638)) {
+        throw "VC++ redistributable install failed (exit code $($proc.ExitCode)). Install it manually from https://aka.ms/vs/17/release/vc_redist.x64.exe and re-run this script."
+    }
+    Log "VC++ redistributable installed"
 }
 
 function Stop-ApacheIfRunning {
@@ -272,8 +335,8 @@ function Enable-RequiredExtensions {
     }
 }
 
-function Update-SystemPathForPhp {
-    param([Parameter(Mandatory=$true)][string]$PhpDir)
+function Add-DirectoryToMachinePath {
+    param([Parameter(Mandatory=$true)][string]$Directory)
 
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     if ([string]::IsNullOrWhiteSpace($machinePath)) {
@@ -283,26 +346,26 @@ function Update-SystemPathForPhp {
     $entries = @($machinePath -split ';' | Where-Object { $_ -and $_.Trim() })
     $alreadyPresent = $false
     foreach ($entry in $entries) {
-        if ($entry.TrimEnd('\') -ieq $PhpDir.TrimEnd('\')) {
+        if ($entry.TrimEnd('\') -ieq $Directory.TrimEnd('\')) {
             $alreadyPresent = $true
             break
         }
     }
 
     if ($alreadyPresent) {
-        Log "System PATH already includes $PhpDir"
+        Log "System PATH already includes $Directory"
         return $false
     }
 
     $updatedPath = if ([string]::IsNullOrWhiteSpace($machinePath)) {
-        $PhpDir
+        $Directory
     }
     else {
-        $machinePath.TrimEnd(';') + ';' + $PhpDir
+        $machinePath.TrimEnd(';') + ';' + $Directory
     }
 
     [Environment]::SetEnvironmentVariable('Path', $updatedPath, 'Machine')
-    Log "Added $PhpDir to the machine PATH"
+    Log "Added $Directory to the machine PATH"
     return $true
 }
 
@@ -424,12 +487,37 @@ function Set-AppVirtualHost {
         [Parameter(Mandatory=$true)][string]$VhostsConfPath,
         [Parameter(Mandatory=$true)][string]$AppName,
         [Parameter(Mandatory=$true)][string]$HostName,
-        [Parameter(Mandatory=$true)][string]$DocRoot
+        [Parameter(Mandatory=$true)][string]$DocRoot,
+        [string]$SslCrtPath,
+        [string]$SslKeyPath
     )
 
     $forwardDocRoot = $DocRoot -replace '\\', '/'
     $beginMarker = "# BEGIN $AppName (managed by update-xampp-php.ps1)"
     $endMarker   = "# END $AppName"
+
+    $httpsSection = ""
+    if ($SslCrtPath -and $SslKeyPath) {
+        $forwardCrt = $SslCrtPath -replace '\\', '/'
+        $forwardKey = $SslKeyPath -replace '\\', '/'
+        $httpsSection = @"
+
+
+<VirtualHost *:443>
+    ServerName $HostName
+    DocumentRoot "$forwardDocRoot"
+
+    SSLEngine on
+    SSLCertificateFile "$forwardCrt"
+    SSLCertificateKeyFile "$forwardKey"
+
+    <Directory "$forwardDocRoot">
+        AllowOverride All
+        Require all granted
+    </Directory>
+</VirtualHost>
+"@
+    }
 
     $block = @"
 $beginMarker
@@ -441,7 +529,7 @@ $beginMarker
         AllowOverride All
         Require all granted
     </Directory>
-</VirtualHost>
+</VirtualHost>$httpsSection
 $endMarker
 "@
 
@@ -623,6 +711,115 @@ function Repair-WeakSslCertificate {
     return $true
 }
 
+function New-AppSslCertificate {
+    param(
+        [Parameter(Mandatory=$true)][string]$ApacheDir,
+        [Parameter(Mandatory=$true)][string]$AppName,
+        [Parameter(Mandatory=$true)][string]$HostName
+    )
+
+    # A dedicated cert per app, not XAMPP's shared ssl.crt/server.crt (which stays
+    # CN=localhost for the XAMPP dashboard's own https://localhost vhost), so its
+    # Subject Alternative Name actually matches $HostName - modern browsers reject
+    # CN-only certs outright. Note that HTTPS alone (even with a cert the browser
+    # doesn't trust) already satisfies window.isSecureContext, which is what actually
+    # unblocks camera/microphone access; a properly matching, trusted cert (see
+    # Install-TrustedCertificate) only removes the "Not Secure" interstitial on top of
+    # that.
+    $opensslExe = Join-Path $ApacheDir "bin\openssl.exe"
+    $crtPath = Join-Path $ApacheDir "conf\ssl.crt\$AppName.crt"
+    $keyPath = Join-Path $ApacheDir "conf\ssl.key\$AppName.key"
+    $cnfPath = Join-Path $ApacheDir "conf\openssl.cnf"
+
+    if (-not (Test-Path $opensslExe)) {
+        Log "WARNING: apache\bin\openssl.exe not found; cannot generate an SSL certificate for $HostName"
+        return $null
+    }
+
+    if ((Test-Path $crtPath) -and (Test-Path $keyPath)) {
+        $textResult = Invoke-PhpCli -PhpExe $opensslExe -Arguments @("x509", "-in", $crtPath, "-noout", "-text")
+        if ($textResult.StdOut -match [regex]::Escape("DNS:$HostName")) {
+            return [pscustomobject]@{ CrtPath = $crtPath; KeyPath = $keyPath; Generated = $false }
+        }
+        Log "Existing certificate for '$AppName' doesn't cover $HostName; regenerating"
+    }
+
+    New-Item -ItemType Directory -Force -Path (Split-Path $crtPath) | Out-Null
+    New-Item -ItemType Directory -Force -Path (Split-Path $keyPath) | Out-Null
+
+    $reqArgs = @(
+        "req", "-x509", "-nodes", "-newkey", "rsa:2048",
+        "-keyout", $keyPath, "-out", $crtPath,
+        "-days", "3650", "-subj", "/CN=$HostName",
+        "-addext", "subjectAltName=DNS:$HostName"
+    )
+    if (Test-Path $cnfPath) {
+        $reqArgs += @("-config", $cnfPath)
+    }
+
+    $reqResult = Invoke-PhpCli -PhpExe $opensslExe -Arguments $reqArgs
+    if ($reqResult.ExitCode -ne 0) {
+        Log "WARNING: Could not generate an SSL certificate for $HostName - $($reqResult.StdErr)"
+        return $null
+    }
+
+    return [pscustomobject]@{ CrtPath = $crtPath; KeyPath = $keyPath; Generated = $true }
+}
+
+function Enable-SslModule {
+    param([Parameter(Mandatory=$true)][string]$MainConfPath)
+
+    $content = Get-Content -Path $MainConfPath -Raw
+    $changed = $false
+
+    $activeModulePattern = '(?im)^\s*LoadModule\s+ssl_module\s+modules/mod_ssl\.so\s*$'
+    if ($content -notmatch $activeModulePattern) {
+        $commentedModulePattern = '(?im)^\s*#\s*LoadModule\s+ssl_module\s+modules/mod_ssl\.so\s*$'
+        $rx = [regex]::new($commentedModulePattern)
+        if ($rx.IsMatch($content)) {
+            $content = $rx.Replace($content, 'LoadModule ssl_module modules/mod_ssl.so', 1)
+        }
+        else {
+            $content = $content.TrimEnd("`r", "`n") + "`r`nLoadModule ssl_module modules/mod_ssl.so`r`n"
+        }
+        $changed = $true
+    }
+
+    $activeIncludePattern = '(?im)^\s*Include\s+"?conf/extra/httpd-ssl\.conf"?\s*$'
+    if ($content -notmatch $activeIncludePattern) {
+        $commentedIncludePattern = '(?im)^\s*#\s*Include\s+"?conf/extra/httpd-ssl\.conf"?\s*$'
+        $rx = [regex]::new($commentedIncludePattern)
+        if ($rx.IsMatch($content)) {
+            $content = $rx.Replace($content, 'Include conf/extra/httpd-ssl.conf', 1)
+        }
+        else {
+            $content = $content.TrimEnd("`r", "`n") + "`r`nInclude conf/extra/httpd-ssl.conf`r`n"
+        }
+        $changed = $true
+    }
+
+    if ($changed) {
+        Write-TextFileNoBom -Path $MainConfPath -Content $content
+    }
+
+    return $changed
+}
+
+function Install-TrustedCertificate {
+    param([Parameter(Mandatory=$true)][string]$CrtPath)
+
+    # certutil.exe ships with Windows itself, so this needs no XAMPP/openssl dependency.
+    # Purely cosmetic (see the note in New-AppSslCertificate) - only removes the "Not
+    # Secure" browser warning, doesn't affect whether HTTPS/camera access works.
+    $result = Invoke-PhpCli -PhpExe "certutil.exe" -Arguments @("-addstore", "-f", "ROOT", $CrtPath)
+    if ($result.ExitCode -ne 0) {
+        Log "WARNING: Could not add the certificate to Windows' trusted root store: $($result.StdErr)"
+        return $false
+    }
+
+    return $true
+}
+
 function Clear-DirectoryContents {
     param([Parameter(Mandatory=$true)][string]$Path)
 
@@ -753,6 +950,65 @@ function Merge-LegacyScalarSettings {
     return $newIniContent
 }
 
+$script:Interactive = -not $PSBoundParameters.ContainsKey('XamppPath')
+
+if ($script:Interactive) {
+    Write-Host ""
+    Write-Host "=== XAMP PHP Updater ===" -ForegroundColor Cyan
+    Write-Host "This backs up and replaces the PHP version in your XAMPP install, then" -ForegroundColor Cyan
+    Write-Host "configures Apache for your app. Press Ctrl+C at any point to abort." -ForegroundColor Cyan
+    Write-Host ""
+
+    $detected = Get-DefaultXamppPath
+    $xamppDefault = if ($detected) { $detected } else { 'C:\xampp' }
+    $XamppPath = Read-PromptWithDefault -Prompt "XAMPP folder" -Default $xamppDefault
+    while (-not ((Test-Path (Join-Path $XamppPath 'php')) -and (Test-Path (Join-Path $XamppPath 'mysql')))) {
+        Write-Host "That folder doesn't look like a XAMPP install (missing php\ or mysql\ subfolder)." -ForegroundColor Red
+        $XamppPath = Read-PromptWithDefault -Prompt "XAMPP folder" -Default $XamppPath
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('PhpZipPath')) {
+        $zipCandidates = @(Get-ChildItem -Path $script:ScriptDir -Filter 'php-*.zip' -File -ErrorAction SilentlyContinue)
+        $zipDefault = if ($zipCandidates.Count -gt 0) { $zipCandidates[0].FullName } else { '' }
+        $PhpZipPath = Read-PromptWithDefault -Prompt "PHP zip to install" -Default $zipDefault
+    }
+    while (-not (Test-Path $PhpZipPath)) {
+        Write-Host "That zip file doesn't exist." -ForegroundColor Red
+        $PhpZipPath = Read-PromptWithDefault -Prompt "PHP zip to install" -Default $PhpZipPath
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('BackupMySql')) {
+        $ans = Read-PromptWithDefault -Prompt "Back up the MySQL folder before updating? (y/n)" -Default 'y'
+        if ($ans -match '^(y|yes)$') {
+            Write-Host "Stop the MySQL service from the XAMPP control panel before continuing." -ForegroundColor Yellow
+            Read-Host "Press Enter once MySQL is stopped (or Ctrl+C to abort)" | Out-Null
+            $BackupMySql = $true
+        }
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('AppName')) {
+        $AppName = Read-PromptWithDefault -Prompt "App name (folder / hostname, e.g. 'rps')" -Default 'rps'
+    }
+    if (-not $PSBoundParameters.ContainsKey('DocRootSubfolder')) {
+        $DocRootSubfolder = Read-PromptWithDefault -Prompt "Document root subfolder" -Default 'public'
+    }
+    if (-not $PSBoundParameters.ContainsKey('SourcePath')) {
+        $SourcePath = Read-PromptWithDefault -Prompt "App source .zip to deploy (optional, leave blank to skip)" -Default ''
+    }
+    while ($SourcePath -and -not (Test-Path $SourcePath)) {
+        Write-Host "That zip file doesn't exist." -ForegroundColor Red
+        $SourcePath = Read-PromptWithDefault -Prompt "App source .zip to deploy (optional, leave blank to skip)" -Default ''
+    }
+
+    Write-Host ""
+    Write-Host "Ready to update PHP in '$XamppPath' and configure app '$AppName'." -ForegroundColor Cyan
+    Read-Host "Press Enter to continue (or Ctrl+C to abort)" | Out-Null
+}
+
+if (-not $XamppPath)  { throw "XamppPath is required." }
+if (-not $PhpZipPath) { throw "PhpZipPath is required." }
+if (-not $AppName)    { throw "AppName is required." }
+
 try {
     $XamppPath = $XamppPath.TrimEnd('\')
     $phpDir   = Join-Path $XamppPath "php"
@@ -769,6 +1025,8 @@ try {
     if (-not (Test-Path $htdocsDir))     { throw "htdocs folder not found: $htdocsDir" }
     if (-not (Test-Path $xamppConfPath)) { throw "httpd-xampp.conf not found: $xamppConfPath" }
     if (-not (Test-Path $httpdExe))      { throw "httpd.exe not found: $httpdExe" }
+
+    Install-VCRedistIfNeeded
 
     $appDir  = Join-Path $htdocsDir $AppName
     $docRoot = Join-Path $appDir $DocRootSubfolder
@@ -923,13 +1181,18 @@ try {
         Log "No conflicting Apache-bundled curl dependency DLLs found"
     }
 
-    $sslCertRegenerated = $false
-    if ($replacedSharedDlls -contains 'libssl-3-x64.dll' -or $replacedSharedDlls -contains 'libcrypto-3-x64.dll') {
-        $apacheDir = Join-Path $XamppPath "apache"
-        $sslCertRegenerated = Repair-WeakSslCertificate -ApacheDir $apacheDir -BackupDir $backupDir -Timestamp $ts
-        if ($sslCertRegenerated) {
-            Log "Regenerated XAMPP's self-signed SSL certificate with a 2048-bit key (the old one was rejected by the newer OpenSSL build now shared with php_curl.dll)"
-        }
+    # Always check the cert's key size, not just when this run happened to replace the
+    # OpenSSL DLLs (Repair-WeakSslCertificate has its own idempotent >=2048-bit check and
+    # is a no-op if the cert is already fine). Gating this on $replacedSharedDlls -contains
+    # meant the check only ever ran on the one run where the DLL swap actually happened
+    # (hashes match on every later run, so nothing gets "replaced") - if that first
+    # regeneration failed, or the cert reverted for any reason (reinstall, restore from
+    # backup, etc.), every subsequent run would silently skip re-checking it, leaving
+    # Apache permanently stuck refusing to start with "ee key too small".
+    $apacheDir = Join-Path $XamppPath "apache"
+    $sslCertRegenerated = Repair-WeakSslCertificate -ApacheDir $apacheDir -BackupDir $backupDir -Timestamp $ts
+    if ($sslCertRegenerated) {
+        Log "Regenerated XAMPP's self-signed SSL certificate with a 2048-bit key (the old one was rejected by the newer OpenSSL build now shared with php_curl.dll)"
     }
 
     # ================== APP DEPLOYMENT (optional) ==================
@@ -984,7 +1247,7 @@ try {
 
     $systemPathUpdated = $false
     try {
-        $systemPathUpdated = Update-SystemPathForPhp -PhpDir $phpDir
+        $systemPathUpdated = Add-DirectoryToMachinePath -Directory $phpDir
         if ($systemPathUpdated) {
             Broadcast-EnvironmentChange
         }
@@ -992,6 +1255,25 @@ try {
     catch {
         Log "WARNING: Could not update machine PATH (needs admin rights): $($_.Exception.Message)"
         Log "WARNING: PHP CLI may not be on PATH; Apache is unaffected by this and will still work."
+    }
+
+    # mysqldump/mysql aren't on PATH by default on a stock XAMPP install either - apps
+    # that shell out to them (e.g. RPS's backup feature) fail with "'mysqldump' is not
+    # recognized" until this is added, the same class of problem PHP had before the
+    # block above.
+    $mysqlBinDir = Join-Path $mysqlDir "bin"
+    $mysqlPathUpdated = $false
+    try {
+        if (Test-Path $mysqlBinDir) {
+            $mysqlPathUpdated = Add-DirectoryToMachinePath -Directory $mysqlBinDir
+            if ($mysqlPathUpdated) {
+                Broadcast-EnvironmentChange
+            }
+        }
+    }
+    catch {
+        Log "WARNING: Could not update machine PATH (needs admin rights): $($_.Exception.Message)"
+        Log "WARNING: mysqldump/mysql may not be on PATH; apps that shell out to them (e.g. RPS backups) may fail."
     }
 
     # ================== APACHE VIRTUAL HOST CONFIG ==================
@@ -1025,8 +1307,33 @@ try {
         Log "Added a default VirtualHost for 'localhost' so the XAMPP dashboard keeps working"
     }
 
-    Log "Adding/updating VirtualHost for '$AppName' -> http://$hostName"
-    Set-AppVirtualHost -VhostsConfPath $vhostsConfPath -AppName $AppName -HostName $hostName -DocRoot $docRoot
+    # HTTPS for the app's own hostname, not just XAMPP's shared https://localhost - a
+    # plain http://$hostName origin is treated as insecure by browsers, which blocks
+    # camera/microphone access (getUserMedia) and other secure-context-only APIs.
+    $sslModuleEnabled = Enable-SslModule -MainConfPath $mainConfPath
+    if ($sslModuleEnabled) {
+        Log "Enabled mod_ssl (LoadModule ssl_module + Include conf/extra/httpd-ssl.conf) in httpd.conf"
+    }
+    else {
+        Log "mod_ssl was already enabled in httpd.conf"
+    }
+
+    $appCert = New-AppSslCertificate -ApacheDir $apacheDir -AppName $AppName -HostName $hostName
+    if ($appCert) {
+        if ($appCert.Generated) {
+            Log "Generated a self-signed SSL certificate for $hostName"
+            if (Install-TrustedCertificate -CrtPath $appCert.CrtPath) {
+                Log "Trusted the certificate in Windows' Root store (avoids browser 'Not Secure' warnings for $hostName)"
+            }
+        }
+        else {
+            Log "Existing SSL certificate for $hostName is still valid; reusing it"
+        }
+    }
+
+    $urlSummary = if ($appCert) { "http://$hostName and https://$hostName" } else { "http://$hostName (https:// unavailable - see warnings above)" }
+    Log "Adding/updating VirtualHost for '$AppName' -> $urlSummary"
+    Set-AppVirtualHost -VhostsConfPath $vhostsConfPath -AppName $AppName -HostName $hostName -DocRoot $docRoot -SslCrtPath $appCert.CrtPath -SslKeyPath $appCert.KeyPath
 
     $hostsEntryAdded = Add-HostsFileEntry -HostName $hostName -BackupDir $backupDir -Timestamp $ts
     if ($hostsEntryAdded) {
@@ -1070,9 +1377,11 @@ try {
         "",
         "Apache PHP handler + PHPIniDir updated: " + $(if ($apachePhpIntegrationUpdated) { "yes" } else { "already correct" }),
         "Machine PATH updated with: " + $(if ($systemPathUpdated) { $phpDir } else { "already included" }),
+        "Machine PATH updated with (mysql\bin): " + $(if ($mysqlPathUpdated) { $mysqlBinDir } else { "already included" }),
         "",
-        "VirtualHost: http://$hostName -> $docRoot",
+        "VirtualHost: $urlSummary -> $docRoot",
         "Hosts file entry ($hostName): " + $(if ($hostsEntryAdded) { "added" } else { "already present" }),
+        "App SSL certificate ($hostName): " + $(if (-not $appCert) { "failed - see warnings above" } elseif ($appCert.Generated) { "generated" } else { "already valid" }),
         "",
         "Merged php.ini settings:"
     )
@@ -1138,7 +1447,7 @@ try {
     Log "Wrote migration report: $phpUpgradeReportPath"
 
     Log "Done. Backup folder: $backupDir."
-    Log "PHP updated in place. App '$AppName' is available at http://$hostName -> $docRoot"
+    Log "PHP updated in place. App '$AppName' is available at $urlSummary -> $docRoot"
     if (-not $apacheLeftRunning) {
         Log "IMPORTANT: Start Apache from XAMPP Control Panel now (run Control Panel as your normal user, not elevated)."
     }
