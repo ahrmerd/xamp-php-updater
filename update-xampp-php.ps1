@@ -847,6 +847,88 @@ public static class NativeMethods {
     [void][NativeMethods]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 0x0002, 5000, [ref]$result)
 }
 
+function ConvertFrom-PhpIniSize {
+    param([Parameter(Mandatory=$true)][string]$Value)
+
+    $trimmed = $Value.Trim()
+    if ($trimmed -eq '' -or $trimmed -eq '-1') { return -1 } # -1 = unlimited
+
+    if ($trimmed -match '^(\d+)\s*([KMG])$') {
+        $num = [int64]$Matches[1]
+        switch ($Matches[2].ToUpperInvariant()) {
+            'K' { return $num * 1KB }
+            'M' { return $num * 1MB }
+            'G' { return $num * 1GB }
+        }
+    }
+
+    if ($trimmed -match '^\d+$') { return [int64]$trimmed }
+
+    return 0
+}
+
+function Set-MinimumIniDirective {
+    param(
+        [Parameter(Mandatory=$true)][string]$Content,
+        [Parameter(Mandatory=$true)][string]$Key,
+        [Parameter(Mandatory=$true)][string]$MinimumValue,
+        [Parameter(Mandatory=$true)][ValidateSet('size', 'count')][string]$Kind,
+        [Parameter(Mandatory=$true)]$Result
+    )
+
+    $pattern = "(?im)^\s*(?!;)\s*" + [regex]::Escape($Key) + "\s*=\s*(.+?)\s*$"
+    $currentRaw = if ($Content -match $pattern) { $Matches[1].Trim() } else { $null }
+
+    if ($Kind -eq 'size') {
+        # -1 already means unlimited; never downgrade that.
+        $currentBytes = if ($currentRaw) { ConvertFrom-PhpIniSize -Value $currentRaw } else { 0 }
+        if ($currentBytes -eq -1 -or $currentBytes -ge (ConvertFrom-PhpIniSize -Value $MinimumValue)) {
+            return $Content
+        }
+    }
+    else {
+        # For time/count settings 0 means unlimited in PHP - never downgrade
+        # that, and treat our own "0" targets (e.g. max_execution_time) as
+        # always worth forcing, since nothing current can already exceed it.
+        if ($currentRaw -eq '0' -and $MinimumValue -ne '0') {
+            return $Content
+        }
+        if ($MinimumValue -ne '0') {
+            $currentNum = if ($currentRaw -match '^\d+$') { [int64]$currentRaw } else { 0 }
+            if ($currentNum -ge [int64]$MinimumValue) {
+                return $Content
+            }
+        }
+        elseif ($currentRaw -eq '0') {
+            return $Content
+        }
+    }
+
+    $Result.BaselineDefaultsRaised += "$Key = $MinimumValue (was: $(if ($currentRaw) { $currentRaw } else { 'default' }))"
+
+    return Set-IniDirective -Content $Content -Key $Key -Value $MinimumValue
+}
+
+function Set-RpsRecommendedPhpDefaults {
+    param(
+        [Parameter(Mandatory=$true)][string]$Content,
+        [Parameter(Mandatory=$true)]$Result
+    )
+
+    # Mirrors RPS's own System Health thresholds (app/Services/SystemHealthService.php)
+    # plus headroom for large legacy-data imports and slow-hardware backup
+    # restores - a stock php.ini-production's defaults (30s execution time,
+    # 2M uploads, 128M memory) are well below what RPS needs in practice.
+    $Content = Set-MinimumIniDirective -Content $Content -Key 'memory_limit' -MinimumValue '256M' -Kind 'size' -Result $Result
+    $Content = Set-MinimumIniDirective -Content $Content -Key 'upload_max_filesize' -MinimumValue '20M' -Kind 'size' -Result $Result
+    $Content = Set-MinimumIniDirective -Content $Content -Key 'post_max_size' -MinimumValue '20M' -Kind 'size' -Result $Result
+    $Content = Set-MinimumIniDirective -Content $Content -Key 'max_execution_time' -MinimumValue '0' -Kind 'count' -Result $Result
+    $Content = Set-MinimumIniDirective -Content $Content -Key 'max_input_time' -MinimumValue '300' -Kind 'count' -Result $Result
+    $Content = Set-MinimumIniDirective -Content $Content -Key 'max_input_vars' -MinimumValue '3000' -Kind 'count' -Result $Result
+
+    return $Content
+}
+
 function Update-PhpIniForMigration {
     param(
         [Parameter(Mandatory=$true)][string]$OldIniPath,
@@ -861,6 +943,7 @@ function Update-PhpIniForMigration {
         ScalarSettings = @()
         ExtensionWarnings = @()
         RequiredExtensionsEnabled = @()
+        BaselineDefaultsRaised = @()
     }
 
     $laravelExtensions = @(
@@ -892,6 +975,8 @@ function Update-PhpIniForMigration {
     $extResult = Enable-RequiredExtensions -Content $newIniContent -Extensions $laravelExtensions
     $newIniContent = $extResult.Content
     $result.RequiredExtensionsEnabled = $extResult.Enabled
+
+    $newIniContent = Set-RpsRecommendedPhpDefaults -Content $newIniContent -Result $result
 
     Write-TextFileNoBom -Path $NewIniPath -Content $newIniContent
 
@@ -1143,6 +1228,9 @@ try {
     foreach ($ext in $migration.RequiredExtensionsEnabled) {
         Log "Enabled required extension for Laravel: $ext"
     }
+    foreach ($entry in $migration.BaselineDefaultsRaised) {
+        Log "Raised php.ini default for RPS: $entry"
+    }
 
     $postPhpVersion = $null
     $postLoadedModules = @()
@@ -1390,6 +1478,15 @@ try {
     }
     else {
         $reportLines += "none"
+    }
+
+    $reportLines += ""
+    $reportLines += "php.ini defaults raised for RPS (memory/upload/execution-time/input limits):"
+    if ($migration.BaselineDefaultsRaised.Count -gt 0) {
+        $reportLines += $migration.BaselineDefaultsRaised
+    }
+    else {
+        $reportLines += "none (already at or above the recommended baseline)"
     }
 
     $reportLines += ""

@@ -35,7 +35,11 @@ WHAT IT DOES, IN ORDER
    vc_redist.x64.exe in this folder, or downloads it from Microsoft if that's missing)
 2. Stops Apache (so PHP files aren't locked)
 3. Backs up the current php\ folder (and mysql\ folder, if checked) into XAMPP's backup\ folder
-4. Backs up php.ini and carries over safe settings from the old install
+4. Backs up php.ini and carries over safe settings from the old install, then raises
+   memory_limit, upload/post size limits, max_execution_time, max_input_time and
+   max_input_vars to RPS's recommended minimums if they're still below stock defaults
+   (never lowers a value you've already set higher, e.g. an existing unlimited
+   max_execution_time stays unlimited)
 5. Clears the existing php\ folder contents and copies in the new PHP zip
 6. Does not carry over old extension DLLs; it only warns about extension entries from the old php.ini so you can review them
 7. Deploys the app source zip into htdocs\<app name>, if you provided one
