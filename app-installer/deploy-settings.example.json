@@ -1,0 +1,5 @@
+{
+    "UpdateServerUrl": "https://rps.hanscadi.cloud",
+    "ClientSharedKey": "put-the-client-shared-key-here",
+    "UpdateChannel": "stable"
+}

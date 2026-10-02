@@ -1,3 +1,6 @@
 Output/
 dist/
 vc_redist.x64.exe
+app-installer/app.zip
+app-installer/deploy-settings.json
+app-installer/version.txt
